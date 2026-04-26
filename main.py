@@ -19,7 +19,11 @@ from models import (
     EmbeddingBatchCreateRequest,
     EmbeddingBatchCreateResponse,
     VectorStoreListResponse,
-    ContentChunk
+    ContentChunk,
+    RatingCreateRequest,
+    RatingResponse,
+    UserPreferenceCreateRequest,
+    UserPreferenceResponse
 )
 from config import settings
 from embedding_service import embedding_service
@@ -282,6 +286,47 @@ async def search_vector_store(
         # Execute the query
         results = await db.query_raw(final_query, *query_params)
         
+        # Get user preferences for personalization
+        user_prefs = {}
+        try:
+            prefs_result = await db.query_raw(
+                """
+                SELECT preference_key, preference_value
+                FROM user_preference
+                WHERE user_id = $1
+                """,
+                api_key  # Using API key as user identifier
+            )
+            for pref in prefs_result:
+                user_prefs[pref["preference_key"]] = pref["preference_value"]
+        except Exception:
+            # If we can't get preferences, continue without personalization
+            pass
+        
+        # Get user ratings for embeddings in this vector store to boost ranked results
+        user_ratings = {}
+        try:
+            # Get ratings for embeddings that are in our results
+            embedding_ids = [row[fields.id_field] for row in results]
+            if embedding_ids:
+                # Create placeholders for the IN clause
+                placeholders = ",".join([f"${i}" for i in range(param_count, param_count + len(embedding_ids))])
+                ratings_params = [api_key] + embedding_ids
+                
+                ratings_result = await db.query_raw(
+                    f"""
+                    SELECT embedding_id, rating
+                    FROM user_rating
+                    WHERE user_id = $1 AND embedding_id IN ({placeholders})
+                    """,
+                    *ratings_params
+                )
+                for rating in ratings_result:
+                    user_ratings[rating["embedding_id"]] = rating["rating"]
+        except Exception:
+            # If we can't get ratings, continue without rating-based boosting
+            pass
+        
         # Convert results to SearchResult objects
         search_results = []
         for row in results:
@@ -289,20 +334,45 @@ async def search_vector_store(
             # Cosine distance ranges from 0 (identical) to 2 (opposite)
             similarity_score = max(0, 1 - (row['distance'] / 2))
             
-            # Extract filename from metadata or use a default
+            # Apply personalization based on user preferences and ratings
+            embedding_id = row[fields.id_field]
+            adjusted_score = similarity_score
+            
+            # Boost score based on user ratings (1-5 scale, assuming 3 is neutral)
+            if embedding_id in user_ratings:
+                rating = user_ratings[embedding_id]
+                # Convert rating to a boost factor: 1-2 = negative boost, 4-5 = positive boost
+                rating_boost = (rating - 3) * 0.1  # Each point above/below 3 gives 10% boost/penalty
+                adjusted_score *= (1 + rating_boost)
+            
+            # Apply preference-based boosting
+            # Example: if user has a preference for certain categories in metadata
             metadata = row[fields.metadata_field] or {}
+            for pref_key, pref_value in user_prefs.items():
+                if pref_key in metadata and metadata[pref_key] == pref_value:
+                    # Boost score by 20% for matching preferences
+                    adjusted_score *= 1.2
+                    break  # Apply only one preference boost for simplicity
+            
+            # Ensure score stays in reasonable bounds
+            adjusted_score = max(0.0, min(1.0, adjusted_score))
+            
+            # Extract filename from metadata or use a default
             filename = metadata.get('filename', 'document.txt')
             
             content_chunks = [ContentChunk(type="text", text=row[fields.content_field])]
             
             result = SearchResult(
-                file_id=row[fields.id_field],
+                file_id=embedding_id,
                 filename=filename,
-                score=similarity_score,
+                score=adjusted_score,
                 attributes=metadata if request.return_metadata else None,
                 content=content_chunks
             )
             search_results.append(result)
+        
+        # Re-sort results by adjusted score (descending)
+        search_results.sort(key=lambda x: x.score, reverse=True)
         
         return VectorStoreSearchResponse(
             search_query=request.query,
@@ -310,13 +380,233 @@ async def search_vector_store(
             has_more=False,  # TODO: Implement pagination
             next_page=None
         )
+        except HTTPException:
+            raise
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+
+
+@app.post("/v1/vector_stores/{vector_store_id}/embeddings/{embedding_id}/rate", response_model=RatingResponse)
+async def rate_embedding(
+    vector_store_id: str,
+    embedding_id: str,
+    request: RatingCreateRequest,
+    api_key: str = Depends(get_api_key)
+):
+    """
+    Rate an embedding (e.g., like/dislike or 1-5 rating).
+    """
+    try:
+        # Check if vector store exists
+        vector_store_table = settings.table_names["vector_stores"]
+        vector_store_result = await db.query_raw(
+            f"SELECT id FROM {vector_store_table} WHERE id = $1",
+            vector_store_id
+        )
+        if not vector_store_result:
+            raise HTTPException(status_code=404, detail="Vector store not found")
+        
+        # Check if embedding exists and belongs to the vector store
+        fields = settings.db_fields
+        table_name = settings.table_names["embeddings"]
+        
+        embedding_result = await db.query_raw(
+            f"""
+            SELECT {fields.id_field} 
+            FROM {table_name} 
+            WHERE {fields.id_field} = $1 AND {fields.vector_store_id_field} = $2
+            """,
+            embedding_id,
+            vector_store_id
+        )
+        
+        if not embedding_result:
+            raise HTTPException(status_code=404, detail="Embedding not found in vector store")
+        
+        # Check if user has already rated this embedding (using API key as user_id)
+        # Upsert: update if exists, insert if not
+        rating_result = await db.query_raw(
+            f"""
+            INSERT INTO user_rating (user_id, embedding_id, rating)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (user_id, embedding_id) 
+            DO UPDATE SET rating = EXCLUDED.rating, created_at = NOW()
+            RETURNING id, user_id, embedding_id, rating, EXTRACT(EPOCH FROM created_at)::bigint as created_at_timestamp
+            """,
+            api_key,  # Using API key as user identifier
+            embedding_id,
+            request.rating
+        )
+        
+        if not rating_result:
+            raise HTTPException(status_code=500, detail="Failed to save rating")
+            
+        rating = rating_result[0]
+        
+        return RatingResponse(
+            id=rating["id"],
+            embedding_id=rating["embedding_id"],
+            rating=rating["rating"],
+            created_at=int(rating["created_at_timestamp"])
+        )
         
     except HTTPException:
         raise
     except Exception as e:
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to rate embedding: {str(e)}")
+
+
+@app.get("/v1/vector_stores/{vector_store_id}/embeddings/{embedding_id}/rating", response_model=RatingResponse)
+async def get_user_rating(
+    vector_store_id: str,
+    embedding_id: str,
+    api_key: str = Depends(get_api_key)
+):
+    """
+    Get the current user's rating for an embedding.
+    """
+    try:
+        # Check if vector store exists
+        vector_store_table = settings.table_names["vector_stores"]
+        vector_store_result = await db.query_raw(
+            f"SELECT id FROM {vector_store_table} WHERE id = $1",
+            vector_store_id
+        )
+        if not vector_store_result:
+            raise HTTPException(status_code=404, detail="Vector store not found")
+        
+        # Check if embedding exists and belongs to the vector store
+        fields = settings.db_fields
+        table_name = settings.table_names["embeddings"]
+        
+        embedding_result = await db.query_raw(
+            f"""
+            SELECT {fields.id_field} 
+            FROM {table_name} 
+            WHERE {fields.id_field} = $1 AND {fields.vector_store_id_field} = $2
+            """,
+            embedding_id,
+            vector_store_id
+        )
+        
+        if not embedding_result:
+            raise HTTPException(status_code=404, detail="Embedding not found in vector store")
+        
+        # Get user's rating for this embedding
+        rating_result = await db.query_raw(
+            f"""
+            SELECT id, user_id, embedding_id, rating, EXTRACT(EPOCH FROM created_at)::bigint as created_at_timestamp
+            FROM user_rating
+            WHERE user_id = $1 AND embedding_id = $2
+            """,
+            api_key,  # Using API key as user identifier
+            embedding_id
+        )
+        
+        if not rating_result:
+            raise HTTPException(status_code=404, detail="Rating not found for this user and embedding")
+            
+        rating = rating_result[0]
+        
+        return RatingResponse(
+            id=rating["id"],
+            embedding_id=rating["embedding_id"],
+            rating=rating["rating"],
+            created_at=int(rating["created_at_timestamp"])
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to get rating: {str(e)}")
+
+
+@app.post("/v1/user/preferences", response_model=UserPreferenceResponse)
+async def set_user_preference(
+    request: UserPreferenceCreateRequest,
+    api_key: str = Depends(get_api_key)
+):
+    """
+    Set a user preference for personalized ranking.
+    """
+    try:
+        # Upsert user preference
+        preference_result = await db.query_raw(
+            f"""
+            INSERT INTO user_preference (user_id, preference_key, preference_value)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (user_id, preference_key) 
+            DO UPDATE SET preference_value = EXCLUDED.preference_value, updated_at = NOW()
+            RETURNING id, user_id, preference_key, preference_value, EXTRACT(EPOCH FROM updated_at)::bigint as updated_at_timestamp
+            """,
+            api_key,  # Using API key as user identifier
+            request.preference_key,
+            request.preference_value
+        )
+        
+        if not preference_result:
+            raise HTTPException(status_code=500, detail="Failed to save preference")
+            
+        preference = preference_result[0]
+        
+        return UserPreferenceResponse(
+            id=preference["id"],
+            preference_key=preference["preference_key"],
+            preference_value=preference["preference_value"],
+            updated_at=int(preference["updated_at_timestamp"])
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to set preference: {str(e)}")
+
+
+@app.get("/v1/user/preferences/{preference_key}", response_model=UserPreferenceResponse)
+async def get_user_preference(
+    preference_key: str,
+    api_key: str = Depends(get_api_key)
+):
+    """
+    Get a user preference.
+    """
+    try:
+        preference_result = await db.query_raw(
+            f"""
+            SELECT id, user_id, preference_key, preference_value, EXTRACT(EPOCH FROM updated_at)::bigint as updated_at_timestamp
+            FROM user_preference
+            WHERE user_id = $1 AND preference_key = $2
+            """,
+            api_key,  # Using API key as user identifier
+            preference_key
+        )
+        
+        if not preference_result:
+            raise HTTPException(status_code=404, detail="Preference not found")
+            
+        preference = preference_result[0]
+        
+        return UserPreferenceResponse(
+            id=preference["id"],
+            preference_key=preference["preference_key"],
+            preference_value=preference["preference_value"],
+            updated_at=int(preference["updated_at_timestamp"])
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to get preference: {str(e)}")
 
 
 @app.post("/v1/vector_stores/{vector_store_id}/embeddings", response_model=EmbeddingResponse)

@@ -84,3 +84,28 @@ class VectorStoreListResponse(BaseModel):
     first_id: Optional[str] = None
     last_id: Optional[str] = None
     has_more: bool = False
+
+
+# New models for user interactions
+class RatingCreateRequest(BaseModel):
+    embedding_id: str
+    rating: int  # Assuming 1-5 scale
+
+
+class RatingResponse(BaseModel):
+    id: str
+    embedding_id: str
+    rating: int
+    created_at: int
+
+
+class UserPreferenceCreateRequest(BaseModel):
+    preference_key: str
+    preference_value: Any  # Could be string, number, boolean, or object
+
+
+class UserPreferenceResponse(BaseModel):
+    id: str
+    preference_key: str
+    preference_value: Any
+    updated_at: int

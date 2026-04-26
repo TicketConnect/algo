@@ -22,6 +22,7 @@ model VectorStore {
   last_active_at DateTime?
   metadata     Json?
   embeddings   Embedding[]
+  ratings      UserRating[]
   
   @@map("vector_stores")
 }
@@ -35,6 +36,29 @@ model Embedding {
   created_at      DateTime    @default(now())
   
   vector_store    VectorStore @relation(fields: [vector_store_id], references: [id], onDelete: Cascade)
+  ratings         UserRating[]
   
   @@map("embeddings")
+}
+
+model UserRating {
+  id              String   @id @default(cuid())
+  user_id         String   // This would be the API key or user identifier
+  embedding_id    String
+  rating          Int      // Rating from 1-5 or similar scale
+  created_at      DateTime @default(now())
+  
+  embedding       Embedding @relation(fields: [embedding_id], references: [id], onDelete: Cascade)
+  
+  @@index([user_id, embedding_id])
+}
+
+model UserPreference {
+  id              String   @id @default(cuid())
+  user_id         String   // This would be the API key or user identifier
+  preference_key  String   // Key for the preference (e.g., "preferred_category", "boost_new_content")
+  preference_value Json    // Value of the preference
+  updated_at      DateTime @updatedAt
+  
+  @@index([user_id, preference_key])
 } 
