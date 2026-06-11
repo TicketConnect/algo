@@ -56,6 +56,8 @@ db = Prisma()
 
 security = HTTPBearer()
 
+MAX_EMBED_TEXT_CHARS = 20_000
+
 
 async def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Validate API key from Authorization header"""
@@ -817,7 +819,7 @@ class EmbedResponse(BaseModel):
 
 
 @app.post("/embed", response_model=EmbedResponse)
-async def embed_text(request: EmbedRequest):
+async def embed_text(request: EmbedRequest, api_key: str = Depends(get_api_key)):
     """
     Generate an embedding for arbitrary text.
 
@@ -826,6 +828,11 @@ async def embed_text(request: EmbedRequest):
     """
     if not request.text or not request.text.strip():
         raise HTTPException(status_code=400, detail="text must be a non-empty string")
+    if len(request.text) > MAX_EMBED_TEXT_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"text exceeds maximum length of {MAX_EMBED_TEXT_CHARS} characters",
+        )
 
     try:
         vector = await embedding_service.generate_embedding(request.text)
