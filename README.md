@@ -65,22 +65,24 @@ This service is the embedding layer **and the search index** for TicketConnect's
 
 5. **Backend writes the vector to two stores:**
    - `Event.embedding` in Mongo (`select: false` — heavy field, never returned in normal queries). Used as the cache for the source-event vector and for taste-profile math.
-   - `litellm-pgvector` via `POST /v1/vector_stores/{events_id}/upsert` with `id=eventId`. This is the search index — pgvector's HNSW-style ANN runs the actual nearest-neighbor query.
+   - `litellm-pgvector` via `POST /v1/vector_stores/{events_id}/upsert` with `id=eventId`. This is the search index — pgvector's HNSW ANN index runs the actual nearest-neighbor query. The index is auto-created at startup (HNSW, with an IVFFlat fallback for older pgvector versions); index creation is best-effort and never blocks startup.
 
    The pgvector mirror is **best-effort**: a failure logs but doesn't roll back the Mongo write. Worst case, the event is briefly absent from similar-events search until the next regeneration or a backfill.
 
-6. **User likes events.** Backend writes to `User.likedEvents` + `User.likedEventsWithTime` and fires `recalculateUserTaste(walletAddress)`. That fetches the liked-event embeddings (from Mongo, where they're cached) and computes a **weighted average with a 30-day half-life** — recent likes dominate, old likes fade. Result: `User.tasteEmbedding`.
+6. **User behavior feeds the taste profile.** `recalculateUserTaste(walletAddress)` gathers every behavioral signal — likes (`User.likedEvents`, weight 1), recommendation clicks (weight 0.3), ticket purchases (weight 3), and scanned attendance (weight 4, the strongest statement of taste) — and weights each by signal strength × exponential time decay (**30-day half-life**). The result is stored twice on the user: `tasteEmbedding` (overall weighted mean, the v1 ranker input) and `tasteEmbeddings` (up to 3 interest centroids from weighted spherical k-means, the v2 ranker input — so a techno + kids'-theater user gets both interests served instead of their meaningless average). Purchases, scans, and clicks queue a debounced recalc automatically (`queueTasteRecalc`).
 
 7. **User opens event detail.** The app calls `GET /api/recommendations/similar/:eventId`. Backend runs a **two-phase query**:
 
-   - **Phase 1 — pgvector ranking.** Backend reads the source event's embedding from Mongo (cheap), then `POST /v1/vector_stores/{events_id}/search-by-vector` returns the top N nearest neighbors by cosine distance. Over-fetches `limit × 4` so we have headroom for filtering. Filters by **threshold ≥ 0.75** (calibrated for 1536-d OpenAI embeddings — anything lower is essentially noise; unrelated events typically score 0.65–0.72).
-   - **Phase 2 — Mongo state filter.** Backend looks up those candidate `eventId`s in Mongo with `isPublished: true`, `eventDate ≥ now`. Drops any candidate that's been deleted, unpublished, or moved to a past date. Preserves pgvector's similarity ordering and returns the top `limit` survivors.
+   - **Phase 1 — pgvector ranking.** Backend reads the source event's embedding from Mongo (cheap), then `POST /v1/vector_stores/{events_id}/search-by-vector` returns the top N nearest neighbors by cosine distance. Over-fetches `limit × 4` so we have headroom for filtering. Filters by a **per-model threshold** (default 0.75 for ada-002 similar-events; see Configuration below — swap the embedding model and the thresholds must be recalibrated).
+   - **Phase 2 — Mongo state filter + domain re-rank.** Backend looks up those candidate `eventId`s in Mongo with `isPublished: true`, `eventDate ≥ now`, dropping deleted/unpublished/past candidates. On the **v2 ranker** the survivors are then re-ranked: `cosine × date-proximity boost (≤ +10%) × same-city boost (+10%) × recent-sales boost (≤ +8%)`, followed by **MMR diversity** (λ=0.75, max 2 events per organizer) so the shelf isn't five copies of one organizer's weekly series. The v1 ranker (A/B control, `RECS_V2_PERCENT`) preserves pure cosine order.
 
    **Why two phases?** pgvector knows vectors but not application state (publish status, date moves). Mongo knows state but doesn't have an index for vector similarity. Splitting the work means each store does what it's best at, with no metadata sync between them.
 
    **Fallback:** if pgvector is unavailable, backend falls back to the legacy Mongo+JS scan so the feature degrades to "slower but works" instead of "broken."
 
-8. **App renders** the horizontal `SimilarEvents` scroller (`app/components/EventDetail/SimilarEvents.tsx`). Clicks are logged to `/api/recommendations/click` for analytics.
+8. **App renders** the horizontal `SimilarEvents` scroller (`app/components/EventDetail/SimilarEvents.tsx`). Clicks are logged to `/api/recommendations/click` for analytics — the response's `algorithm` field (`semantic_v1` / `semantic_v2` / `popularity_v1` / `mongo_scan_v1`) is echoed with each click so CTR is comparable per ranker (`GET /api/recommendations/analytics`).
+
+   **Cold start:** users without a taste profile get a popularity fallback (top ticket sellers of the last 30 days, padded with the soonest upcoming events) instead of an empty feed.
 
 ### Service boundaries
 
@@ -104,6 +106,7 @@ These extend the OpenAI-compatible API for our use case:
 | `POST /v1/vector_stores/{store}/search-by-vector` | Search by precomputed embedding (no LLM call). Supports `exclude_ids` and metadata `filters`. |
 | `DELETE /v1/vector_stores/{store}/embeddings/{id}` | Idempotent delete. Called on event deletion. |
 | `GET /v1/vector_stores/by-name/{name}` | Look up store by name; lets backend self-bootstrap (find-or-create). |
+| `GET /v1/vector_stores/{store}/stats` | `{ "id", "embeddings" }` row count for the store. Called by the backend's nightly drift reconciler. |
 
 ### Bootstrap
 
@@ -125,20 +128,24 @@ If you need to reset the index (e.g. after a model swap that changed embedding d
 
 - **Embedding service health:** `GET /api/recommendations/health` on the backend pings `POST /embed` end-to-end.
 
-- **Threshold tuning:** edit the `getSimilarEvents` default in `Backend/src/services/recommendationService.ts`. Start at 0.75; raise if results feel loose, lower if the section is too often empty.
+- **Threshold tuning:** thresholds are keyed on the embedding model and overridable per knob; see Configuration. Raise if results feel loose, lower if shelves are too often empty. Validate any change with the offline eval: `bun src/scripts/eval-recall.ts` (leave-one-out recall@10 / MRR for both rankers, read-only).
 
-- **Configuration:** the backend reads two env vars:
+- **Configuration (backend env vars):**
   - `EMBEDDING_SERVICE_URL` (default `http://localhost:8000`)
   - `EMBEDDING_SERVICE_API_KEY` (default `sk-1234`) — must match `SERVER_API_KEY` on this service.
+  - `EMBEDDING_MODEL` (default `text-embedding-ada-002`) — selects the per-model threshold defaults; must match the LiteLLM proxy's embedding model. After a swap: full reindex (`/backfill`) + recalibrate.
+  - `RECS_SIMILAR_THRESHOLD` / `RECS_FEED_THRESHOLD` — explicit threshold overrides.
+  - `RECS_V2_PERCENT` (default `100`) — share of traffic on the v2 ranker (multi-centroid + re-rank + MMR); the rest gets v1 as the A/B control.
+  - `RECS_TASTE_DEBOUNCE_MS` (default `60000`) — debounce window for behavioral taste recalcs.
 
-### Drift detection (optional)
+- **After pulling this change:** run `prisma generate` — the `UserRating` and `UserPreference` schema models were removed. Optionally `DROP TABLE user_rating; DROP TABLE user_preference;` — the service no longer reads them.
 
-Mongo and pgvector can drift if a pgvector write fails silently. Two cheap mitigations:
+### Drift detection
+
+Mongo and pgvector can drift if a pgvector write fails silently. Two mitigations:
 
 1. **Self-healing on read:** the search-by-vector path tolerates pgvector returning ids that don't exist in Mongo (deleted events) — they're filtered out in phase 2.
-2. **Periodic reconciler:** a nightly job that compares `count(events with embedding in Mongo)` vs `count(rows in pgvector for the events store)` and triggers `?mode=pgvector-only` backfill if they diverge by more than a small margin.
-
-The reconciler isn't shipped — wire one up via cron when you've grown enough to care about consistency at the margin.
+2. **Periodic reconciler:** the backend ships a nightly reconciler (`Backend/src/services/recommendationReconciler.ts`) that compares `count(events with embedding in Mongo)` against this service's `GET /v1/vector_stores/{store}/stats` and triggers a `?mode=pgvector-only` backfill when they diverge.
 
 ---
 

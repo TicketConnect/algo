@@ -1,6 +1,5 @@
 from typing import Optional, Dict, Any, List
 from pydantic import BaseModel
-from datetime import datetime
 
 
 class VectorStoreCreateRequest(BaseModel):
@@ -86,36 +85,7 @@ class VectorStoreListResponse(BaseModel):
     has_more: bool = False
 
 
-# New models for user interactions
-class RatingCreateRequest(BaseModel):
-    embedding_id: str
-    rating: int  # Assuming 1-5 scale
-
-
-class RatingResponse(BaseModel):
-    id: str
-    embedding_id: str
-    rating: int
-    created_at: int
-
-
-class UserPreferenceCreateRequest(BaseModel):
-    preference_key: str
-    preference_value: Any  # Could be string, number, boolean, or object
-
-
-class UserPreferenceResponse(BaseModel):
-    id: str
-    preference_key: str
-    preference_value: Any
-    updated_at: int
-
-
-# Models for event scoring and recommendations
-class EventScoreRequest(BaseModel):
-    event_id: str
-    tags: Optional[List[str]] = None
-    metadata: Optional[Dict[str, Any]] = None
+# Models for event recommendations
 
 
 class SimilarEventsResponse(BaseModel):
@@ -129,7 +99,6 @@ class FeedRecommendationRequest(BaseModel):
     taste_embedding: List[float]
     limit: Optional[int] = 20
     exclude_ids: Optional[List[str]] = None
-    user_id: Optional[str] = None  # wallet address — used to fetch ratings for score boosting
 
 
 class FeedRecommendationItem(BaseModel):
