@@ -1,12 +1,12 @@
-# TicketConnect Algo
+# Gettic Algo
 
 A FastAPI application that provides OpenAI-compatible vector store endpoints using PGVector and LiteLLM proxy for embeddings.
 
 ---
 
-## TicketConnect Recommendation Pipeline
+## Gettic Recommendation Pipeline
 
-This service is the embedding layer **and the search index** for TicketConnect's "similar events" feature. The full data flow:
+This service is the embedding layer and vector index for Gettic's consumer recommendations. TicketConnect's tenant-scoped `/v1/events/:id/similar` also uses the shared recommendation engine during the migration. The full data flow:
 
 ```
                                                        ┌──────────┐
@@ -118,12 +118,12 @@ If you need to reset the index (e.g. after a model swap that changed embedding d
 
 - **First-time deploy:** if your Mongo already has events with embeddings (e.g. you added pgvector mirroring after the fact), run the one-shot mirror to populate pgvector without re-paying for embedding generation:
   ```bash
-  curl -X POST 'http://backend/api/recommendations/backfill?mode=pgvector-only'
+  curl -X POST 'http://gettic-backend/api/recommendations/backfill?mode=pgvector-only'
   ```
 
 - **Full backfill** (regenerate embeddings + mirror to pgvector) — use after first deploy of the embedding pipeline, or after touching `buildEventText`:
   ```bash
-  curl -X POST 'http://backend/api/recommendations/backfill'
+  curl -X POST 'http://gettic-backend/api/recommendations/backfill'
   ```
 
 - **Embedding service health:** `GET /api/recommendations/health` on the backend pings `POST /embed` end-to-end.
